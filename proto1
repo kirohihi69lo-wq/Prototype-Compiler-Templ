@@ -1,0 +1,376 @@
+# -*- coding: utf-8 -*-
+"""single-file tiny compiler: lex/parse/resolve/bytecode/vm"""
+from __future__ import annotations
+import sys, re
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any
+
+# ====== Tokens ======
+@dataclass
+class Tok:
+    k: str; v: str; p: int
+
+KEY = {"let","if","else","while","fn","return","true","false","print"}
+SPEC = [
+    ("WS", r"[ \t\r\n]+"), ("NUM", r"\d+"), ("ID", r"[A-Za-z_]\w*"),
+    ("OP", r"==|!=|<=|>=|&&|\|\|"), ("SY", r"[{}();,=+\-*/%!<>]"),
+]
+RX = re.compile("|".join("(?P<%s>%s)"%p for p in SPEC))
+def lex(src: str)->List[Tok]:
+    out: List[Tok]=[]
+    i=0
+    while i<len(src):
+        m=RX.match(src,i)
+        if not m: raise SyntaxError(f"lex @ {i}")
+        k=m.lastgroup; s=m.group()
+        if k=="WS": pass
+        elif k=="ID" and s in KEY: out.append(Tok(s.upper(),s,i))
+        elif k=="ID": out.append(Tok("ID",s,i))
+        elif k=="NUM": out.append(Tok("NUM",s,i))
+        elif k=="OP": out.append(Tok(s,s,i))
+        else: out.append(Tok(s,s,i))
+        i=m.end()
+    out.append(Tok("EOF","",i))
+    return out
+
+# ====== AST ======
+@dataclass
+class Node: pass
+@dataclass
+class NNum(Node): v:int
+@dataclass
+class NBool(Node): v:bool
+@dataclass
+class NVar(Node): name:str
+@dataclass
+class NUnary(Node): op:str; x:Node
+@dataclass
+class NBinary(Node): op:str; a:Node; b:Node
+@dataclass
+class NAssign(Node): name:str; val:Node
+@dataclass
+class NLet(Node): name:str; val:Node
+@dataclass
+class NBlock(Node): items:List[Node]
+@dataclass
+class NIf(Node): cond:Node; then:Node; els:Optional[Node]
+@dataclass
+class NWhile(Node): cond:Node; body:Node
+@dataclass
+class NCall(Node): name:str; args:List[Node]
+@dataclass
+class NReturn(Node): val:Optional[Node]
+@dataclass
+class NPrint(Node): val:Node
+@dataclass
+class NFn(Node): name:str; params:List[str]; body:NBlock
+@dataclass
+class NProg(Node): items:List[Node]
+
+# ====== Parser (Pratt) ======
+class P:
+    def __init__(self,toks:List[Tok]): self.t=toks; self.i=0
+    def peek(self)->Tok: return self.t[self.i]
+    def eat(self,k=None)->Tok:
+        tok=self.peek()
+        if k and tok.k!=k: raise SyntaxError(f"want {k} got {tok.k}")
+        self.i+=1; return tok
+
+    def parse(self)->NProg:
+        items=[]
+        while self.peek().k!="EOF":
+            if self.peek().k=="FN": items.append(self.fn())
+            else: items.append(self.stmt())
+        return NProg(items)
+
+    def fn(self)->NFn:
+        self.eat("FN"); name=self.eat("ID").v; self.eat("(")
+        params=[]
+        if self.peek().k!=")":
+            while True:
+                params.append(self.eat("ID").v)
+                if self.peek().k!="," : break
+                self.eat(",")
+        self.eat(")"); body=self.block()
+        return NFn(name,params,body)
+
+    def block(self)->NBlock:
+        self.eat("{"); items=[]
+        while self.peek().k!="}": items.append(self.stmt())
+        self.eat("}"); return NBlock(items)
+
+    def stmt(self)->Node:
+        k=self.peek().k
+        if k=="LET":
+            self.eat("LET"); n=self.eat("ID").v; self.eat("=")
+            v=self.expr(); self.eat(";"); return NLet(n,v)
+        if k=="RETURN":
+            self.eat("RETURN")
+            if self.peek().k==";": self.eat(";"); return NReturn(None)
+            v=self.expr(); self.eat(";"); return NReturn(v)
+        if k=="IF": return self.ifstmt()
+        if k=="WHILE":
+            self.eat("WHILE"); c=self.expr(); b=self.block(); return NWhile(c,b)
+        if k=="{": return self.block()
+        if k=="PRINT":
+            self.eat("PRINT"); self.eat("("); v=self.expr(); self.eat(")"); self.eat(";"); return NPrint(v)
+        # assign or expr;
+        if self.peek().k=="ID" and self.t[self.i+1].k=="=":
+            n=self.eat("ID").v; self.eat("="); v=self.expr(); self.eat(";"); return NAssign(n,v)
+        e=self.expr(); self.eat(";"); return e
+
+    def ifstmt(self)->NIf:
+        self.eat("IF"); c=self.expr(); th=self.block(); el=None
+        if self.peek().k=="ELSE":
+            self.eat("ELSE")
+            el=self.block() if self.peek().k=="{" else self.stmt()
+        return NIf(c,th,el)
+
+    # Pratt expr
+    LB={"||":1,"&&":2,"==":3,"!=":3,"<":4,"<=":4,">":4,">=":4,
+        "+":5,"-":5,"*":6,"/":6,"%":6}
+    def expr(self,minbp=1)->Node:
+        tok=self.peek()
+        if tok.k in ("-","!"):
+            self.eat(tok.k); left=NUnary(tok.k,self.expr(7))
+        elif tok.k=="(":
+            self.eat("("); left=self.expr(); self.eat(")")
+        elif tok.k=="NUM":
+            left=NNum(int(self.eat("NUM").v))
+        elif tok.k in ("TRUE","FALSE"):
+            left=NBool(tok.k=="TRUE"); self.eat(tok.k)
+        elif tok.k=="ID":
+            idt=self.eat("ID").v
+            if self.peek().k=="(":
+                self.eat("("); args=[]
+                if self.peek().k!=")":
+                    while True:
+                        args.append(self.expr())
+                        if self.peek().k!="," : break
+                        self.eat(",")
+                self.eat(")"); left=NCall(idt,args)
+            else: left=NVar(idt)
+        else:
+            raise SyntaxError(f"expr @ {tok.p}")
+        while True:
+            op=self.peek().k
+            if op not in self.LB: break
+            lb=self.LB[op]; if lb<minbp: break
+            self.eat(op)
+            rb=lb+1
+            right=self.expr(rb)
+            left=NBinary(op,left,right)
+        return left
+
+# ====== Resolver / Scopes ======
+class Scope:
+    def __init__(self,parent:Optional[Scope]=None):
+        self.p=parent; self.idx:Dict[str,int]={}; self.n=0
+    def define(self,name:str)->int:
+        if name in self.idx: raise NameError(f"dup {name}")
+        self.idx[name]=self.n; self.n+=1; return self.idx[name]
+    def lookup(self,name:str)->Tuple[int,int]:
+        d=0; s=self
+        while s:
+            if name in s.idx: return d,s.idx[name]
+            d+=1; s=s.p
+        raise NameError(f"undef {name}")
+
+# ====== Bytecode ======
+# stack VM, frames hold locals; globals for functions
+I = {
+ "PUSHI":1,"PUSHB":2,"LOAD":3,"STORE":4,"ADD":5,"SUB":6,"MUL":7,"DIV":8,
+ "MOD":9,"NEG":10,"NOT":11,"LT":12,"LE":13,"GT":14,"GE":15,"EQ":16,"NE":17,
+ "AND":18,"OR":19,"JMP":20,"JZ":21,"CALL":22,"RET":23,"PRINT":24,
+}
+@dataclass
+class Fun:
+    name:str; params:int; code:List[Tuple[int,Any]]
+
+# ====== Codegen ======
+class Gen:
+    def __init__(self):
+        self.funs:Dict[str,Fun]={}
+        self.cur:Optional[Fun]=None
+        self.scope:Optional[Scope]=None
+
+    def emit(self,op:str,arg:Any=None):
+        self.cur.code.append((I[op],arg))
+
+    def gen_prog(self, n:NProg):
+        # builtins shim
+        self.funs["main"]=Fun("main",0,[])
+        self.cur=self.funs["main"]; self.scope=Scope(None)
+        for it in n.items:
+            if isinstance(it,NFn): self.declare_fn(it)
+        for it in n.items:
+            if isinstance(it,NFn): self.gen_fn(it)
+            else: self.gen_stmt(it)
+        self.emit("PUSHI",0); self.emit("RET",0)
+
+    def declare_fn(self,f:NFn):
+        if f.name in self.funs: raise NameError("dup fn")
+        self.funs[f.name]=Fun(f.name,len(f.params),[])
+
+    def gen_fn(self,f:NFn):
+        prev_fun,prev_scope=self.cur,self.scope
+        self.cur=self.funs[f.name]
+        self.scope=Scope(None)
+        for p in f.params: self.scope.define(p)
+        self.gen_block(f.body)
+        self.emit("PUSHI",0); self.emit("RET",0)
+        self.cur, self.scope = prev_fun, prev_scope
+
+    def gen_block(self,b:NBlock):
+        parent=self.scope; self.scope=Scope(parent)
+        for it in b.items: self.gen_stmt(it)
+        self.scope=parent
+
+    def gen_stmt(self,s:Node):
+        if isinstance(s,NLet):
+            idx=self.scope.define(s.name)
+            self.gen_exp(s.val); self.emit("STORE",(0,idx))
+        elif isinstance(s,NAssign):
+            d,i=self.scope.lookup(s.name)
+            self.gen_exp(s.val); self.emit("STORE",(d,i))
+        elif isinstance(s,NIf):
+            self.gen_exp(s.cond)
+            jz=len(self.cur.code); self.emit("JZ",None)
+            self.gen_stmt(s.then)
+            if s.els:
+                jmp=len(self.cur.code); self.emit("JMP",None)
+                self.cur.code[jz]=(I["JZ"],len(self.cur.code))
+                self.gen_stmt(s.els)
+                self.cur.code[jmp]=(I["JMP"],len(self.cur.code))
+            else:
+                self.cur.code[jz]=(I["JZ"],len(self.cur.code))
+        elif isinstance(s,NWhile):
+            loop=len(self.cur.code)
+            self.gen_exp(s.cond)
+            jz=len(self.cur.code); self.emit("JZ",None)
+            self.gen_stmt(s.body)
+            self.emit("JMP",loop)
+            self.cur.code[jz]=(I["JZ"],len(self.cur.code))
+        elif isinstance(s,NBlock):
+            self.gen_block(s)
+        elif isinstance(s,NReturn):
+            if s.val is None: self.emit("PUSHI",0)
+            else: self.gen_exp(s.val)
+            self.emit("RET",0)
+        elif isinstance(s,NPrint):
+            self.gen_exp(s.val); self.emit("PRINT",0)
+        else:
+            self.gen_exp(s)
+
+    def gen_exp(self,e:Node):
+        if isinstance(e,NNum): self.emit("PUSHI",e.v)
+        elif isinstance(e,NBool): self.emit("PUSHB",1 if e.v else 0)
+        elif isinstance(e,NVar):
+            d,i=self.scope.lookup(e.name); self.emit("LOAD",(d,i))
+        elif isinstance(e,NUnary):
+            self.gen_exp(e.x)
+            self.emit("NEG" if e.op=="-" else "NOT",0)
+        elif isinstance(e,NBinary):
+            self.gen_exp(e.a); self.gen_exp(e.b)
+            opmap={"+":"ADD","-":"SUB","*":"MUL","/":"DIV","%":"MOD",
+                   "<":"LT","<=":"LE",">":"GT",">=":"GE",
+                   "==":"EQ","!=":"NE","&&":"AND","||":"OR"}
+            self.emit(opmap[e.op],0)
+        elif isinstance(e,NCall):
+            for a in e.args: self.gen_exp(a)
+            self.emit("CALL",(e.name,len(e.args)))
+        else: raise SyntaxError("bad exp")
+
+# ====== VM ======
+class VM:
+    def __init__(self,funs:Dict[str,Fun]):
+        self.f=funs; self.stack:List[Any]=[]
+    def run(self,name="main")->int:
+        return self.exec_fun(name,[])
+    def exec_fun(self,name:str,args:List[Any])->int:
+        fn=self.f[name]; ip=0; code=fn.code
+        locals=[0]*max(8,fn.params)
+        for i,v in enumerate(args): locals[i]=v
+        callstack:List[Tuple[str,int,List[int]]]=[]
+        while True:
+            op,arg = code[ip]
+            if op==I["PUSHI"]: self.stack.append(arg)
+            elif op==I["PUSHB"]: self.stack.append(arg)
+            elif op==I["LOAD"]:
+                d,i=arg; frame=locals
+                for _ in range(d): pass  # single scope depth
+                self.stack.append(frame[i])
+            elif op==I["STORE"]:
+                d,i=arg; frame=locals
+                for _ in range(d): pass
+                frame[i]=self.stack.pop()
+            elif op==I["ADD"]: self.stack.append(self.stack.pop(-2)+self.stack.pop())
+            elif op==I["SUB"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(a-b)
+            elif op==I["MUL"]: self.stack.append(self.stack.pop(-2)*self.stack.pop())
+            elif op==I["DIV"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(a//b)
+            elif op==I["MOD"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(a%b)
+            elif op==I["NEG"]: self.stack.append(-self.stack.pop())
+            elif op==I["NOT"]: self.stack.append(0 if self.stack.pop() else 1)
+            elif op==I["LT"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if a<b else 0)
+            elif op==I["LE"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if a<=b else 0)
+            elif op==I["GT"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if a>b else 0)
+            elif op==I["GE"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if a>=b else 0)
+            elif op==I["EQ"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if a==b else 0)
+            elif op==I["NE"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if a!=b else 0)
+            elif op==I["AND"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if (a and b) else 0)
+            elif op==I["OR"]:
+                b=self.stack.pop(); a=self.stack.pop(); self.stack.append(1 if (a or b) else 0)
+            elif op==I["JMP"]: ip=arg; continue
+            elif op==I["JZ"]:
+                v=self.stack.pop(); 
+                if v==0: ip=arg; continue
+            elif op==I["CALL"]:
+                callee,argc=arg
+                a=[self.stack.pop() for _ in range(argc)][::-1]
+                callstack.append((fn.name,ip+1,locals))
+                fn=self.f[callee]; code=fn.code; ip=0
+                locals=[0]*max(8,fn.params)
+                for i,v in enumerate(a): locals[i]=v
+                continue
+            elif op==I["RET"]:
+                rv=self.stack.pop()
+                if not callstack: return int(rv)
+                fnname,ip,locals_prev=callstack.pop()
+                fn=self.f[fnname]; code=fn.code; locals=locals_prev
+                self.stack.append(rv); continue
+            elif op==I["PRINT"]:
+                v=self.stack.pop(); print(v)
+            else: raise RuntimeError("bad op")
+            ip+=1
+
+# ====== Compile API ======
+def compile_src(src:str)->Tuple[Dict[str,Fun],Gen]:
+    toks=lex(src); ast=P(toks).parse(); g=Gen(); g.gen_prog(ast); return g.funs,g
+
+# ====== Demo (optional) ======
+DEMO = r"""
+fn add(a,b){ return a+b; }
+fn fact(n){
+  let r=1;
+  while(n>1){ r=r*n; n=n-1; }
+  return r;
+}
+let x=add(2,3);
+print(x);
+print(fact(6));
+"""
+
+if __name__=="__main__":
+    s = sys.stdin.read() if not sys.stdin.isatty() else DEMO
+    funs,_=compile_src(s)
+    vm=VM(funs); rc=vm.run(); sys.exit(rc)
